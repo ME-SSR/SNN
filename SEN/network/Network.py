@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import networkx as nx
 
 MAX_Distance = 10.0
+InputShape = [10,10]
 
 class PositionedDiehlAndCookNodes(bindsnet.network.nodes.DiehlAndCookNodes):
   def __init__(
@@ -26,6 +27,7 @@ class PositionedDiehlAndCookNodes(bindsnet.network.nodes.DiehlAndCookNodes):
       **kwargs,
   ):
     self.position = position
+
     super().__init__(
       n=n,
       shape=shape,
@@ -74,41 +76,47 @@ def compute_distance_weight(pos1, pos2,MAX_Distance = MAX_Distance):
     return (MAX_Distance - tmp) / MAX_Distance
 
 class PositionWeightConnection(bindsnet.network.topology.Connection):
-  def __init__(
-      self,
-      source: Nodes,
-      target: Nodes,
-      nu: Optional[Union[float, Sequence[float], Sequence[torch.Tensor]]] = None,
-      reduction: Optional[callable] = None,
-      weight_decay: float = None,
-      MAX_Distance: float = MAX_Distance,
-      **kwargs,
-  ):
-    super().__init__(source, target, nu, reduction, weight_decay, **kwargs)
+    def __init__(
+        self,
+        source: Nodes,
+        target: Nodes,
+        nu: Optional[Union[float, Sequence[float], Sequence[torch.Tensor]]] = None,
+        reduction: Optional[callable] = None,
+        weight_decay: float = None,
+        MAX_Distance: float = MAX_Distance,
+        **kwargs,
+    ):
+        super().__init__(source, target, nu, reduction, weight_decay, **kwargs)
 
-    w = kwargs.get("w", None)
-    if w is None:
-        distance_weight = compute_distance_weight(pos1 = source.position, pos2 = target.position)
-        if (self.wmin == -np.inf).any() or (self.wmax == np.inf).any():
-            w = torch.clamp(torch.rand(source.n, target.n), self.wmin, self.wmax) * distance_weight
+        w = kwargs.get("w", None)
+        if w is None:
+            # Compute distance weights for all source-target neuron pairs
+            distance_weights = torch.zeros(source.n, target.n)
+            for i in range(source.n):
+                for j in range(target.n):
+                    distance_weights[i, j] = compute_distance_weight(
+                        pos1=source.position, pos2=target.position 
+                    )
+
+            if (self.wmin == -np.inf).any() or (self.wmax == np.inf).any():
+                w = torch.clamp(torch.rand(source.n, target.n), self.wmin, self.wmax) * distance_weights
+            else:
+                w = self.wmin + torch.rand(source.n, target.n) * (self.wmax - self.wmin) * distance_weights
         else:
-            w = self.wmin + torch.rand(source.n, target.n) * (self.wmax - self.wmin * distance_weight)
-    else:
-        distance_weight = compute_distance_weight(pos1 = source.position,pos2 = target.position)
-        if (self.wmin != -np.inf).any() or (self.wmax != np.inf).any():
-            w = torch.clamp(torch.as_tensor(w), self.wmin, self.wmax) * distance_weight
+            distance_weight = compute_distance_weight(pos1=source.position, pos2=target.position)
+            if (self.wmin != -np.inf).any() or (self.wmax != np.inf).any():
+                w = torch.clamp(torch.as_tensor(w), self.wmin, self.wmax) * distance_weight
 
-    self.w = Parameter(w, requires_grad=False)
+        self.w = Parameter(w, requires_grad=False)
 
-    b = kwargs.get("b", None)
-    if b is not None:
-      self.b = Parameter(b, requires_grad=False)
-    else:
-      self.b = None
+        b = kwargs.get("b", None)
+        if b is not None:
+            self.b = Parameter(b, requires_grad=False)
+        else:
+            self.b = None
 
-    if isinstance(self.target, CSRMNodes):
-      self.s_w = None
-
+        if isinstance(self.target, CSRMNodes):
+            self.s_w = None
 
 class UShapedPipeTopology:
     def __init__(self,dt:float , batch_size:int , num_neurons: int,shape:int, radius: float, u_depth: float):
@@ -141,7 +149,7 @@ class UShapedPipeTopology:
         """
         positions = []
         step = (self.arc_length + self.u_depth) / self.num_neurons
-        
+
         for i in range(self.num_neurons):
             if i * step < self.arc_length:  # Complete U arc
                 theta = np.pi - (i * step) / self.radius
@@ -152,30 +160,35 @@ class UShapedPipeTopology:
                 x = 0
                 y = -2 * self.radius + (i * step - self.arc_length)
                 positions.append((x, y, 0))
-        
+
         return positions
 
     def build(self):
         positions = self._calculate_positions()
+      
 
         # Create nodes at calculated positions
         for i, pos in enumerate(positions):
             layer_name = f"Neuron_{i}"
-            layer = PositionedDiehlAndCookNodes(shape=self.shape, position=torch.Tensor(pos))
-            self.network.add_layer(layer, name=layer_name)
+            if i == 0:
+                layer = PositionedInput(shape=InputShape, position=torch.Tensor(pos))
+                self.network.add_layer(layer, name=layer_name)
+            else:
+                layer = PositionedDiehlAndCookNodes(shape=self.shape, position=torch.Tensor(pos))
+                self.network.add_layer(layer, name=layer_name)
 
             # Connect to the previous neuron
             if i > 0:
                 prev_layer_name = f"Neuron_{i-1}"
                 conn = PositionWeightConnection(source=self.network.layers[prev_layer_name], target=layer)
                 self.network.add_connection(conn, source=prev_layer_name, target=layer_name)
-        
+
         return self.network
 
 
 def visualize_network(network):
     G = nx.DiGraph()
-    
+
     pos = {}  # This dictionary will store the positions of the neurons
 
     for layer_name, layer in network.layers.items():
