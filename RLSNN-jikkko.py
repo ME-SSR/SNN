@@ -1,60 +1,80 @@
 #データローダー、エンコーダー及びデコーダー、そしてモデルの構築
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import random
+import matplotlib.pyplot as plt
+from bindsnet.network import Network
+from bindsnet.network.topology import Connection
+from bindsnet.network.monitors import Monitor
+from bindsnet.analysis.plotting import plot_spikes, plot_voltages
+from bindsnet.analysis.pipeline_analysis import MatplotlibAnalyzer
+#from bindsnet.analysis.visualization import summary
 
 
-# データセット定義
-class RandomDataset(Dataset):
-    def __init__(self, data_size, sequence_length, vocab_size):
-        self.data_size = data_size
-        self.sequence_length = sequence_length
-        self.vocab_size = vocab_size
+torch_fix_seed()
 
-    def __len__(self):
-        return self.data_size
+# Simulation time.
+time = 1000
+spike_rate = 0.5
 
-    def __getitem__(self, idx):
-        return (
-            torch.randint(0, self.vocab_size, (self.sequence_length,)),
-            torch.randint(0, self.vocab_size, (self.sequence_length,))
-        )
+text = "hogehogehogeほげほげほげー"
+max_size = 780
+hidden_dim = 4
+bottleneck_dim = 1
+InputShape = [1,4]
 
-# データセットとデータローダーの初期化
-dataset = RandomDataset(1000, 10, 512)
-dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+autoencoder = Autoencoder(max_size, hidden_dim, bottleneck_dim)
+input_data = string_to_normalized_tensor(text, max_size)
+encoded_data = autoencoder.encoder(input_data)
 
-# モデル定義
-d_model = 512
+snn_encoder = SNNEncoder(time, spike_rate)
+spike_data = snn_encoder.encode(encoded_data)
 
-# 必要な変数の定義
-k = d_model  # embed size
-heads = 8  # attention heads
-vocab_size = 512
+# Create the network.
+network = UShapedPipeTopology(dt = 1.0 , batch_size = 1, num_neurons = 6, shape = ([hidden_dim,bottleneck_dim]), radius = 2, u_depth = 0.1, net_thickness = 3 , net_interval = 2 )
+u_shaped_network = network.build()  # これでネットワークのインスタンスを取得します
 
-# モデルの初期化
-class STDPTransformerWithEmbeddings(nn.Module):
-    def __init__(self, k, heads, num_classes, num_layers=NUM_LAYERS, vocab_size=512):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, k)  # Embedding layer
-        self.encoder = STDPEncoder(k, heads, num_layers)
-        self.capsule_network = MultiCompartmentCapsuleNetwork(input_channels=k, primary_dim=8, num_classes=num_classes, output_dim=16, num_routing=3, num_compartments=2)
-        self.decoder = STDPDecoder(k, heads, num_layers)
-        self.pos_enc = PositionalEncoding(k)
-        self.fc = nn.Linear(k, num_classes)
+visualize_network(u_shaped_network)
+#print(summary(u_shaped_network))
 
-    def forward(self, x, target):
-        x = self.embedding(x)  # Use embedding layer
-        x = x.permute(0, 2, 1)  # Reshape to (batch_size, d_model, sequence_length)
-        x = self.encoder(x)
-        x = self.capsule_network(x)
-        x = self.decoder(x, target)
-        return self.fc(x)
+# Create and add input and output layer monitors.
+source_monitor = Monitor(
+    obj=u_shaped_network.Input,
+    state_vars=("s"),  # Record spikes and voltages.
+    time=time,  # Length of simulation (if known ahead of time).
+)
+target_monitor = Monitor(
+    obj=u_shaped_network.Neuron_0,
+    state_vars=("s", "v"),  # Record spikes and voltages.
+    time=time,  # Length of simulation (if known ahead of time).
+)
 
-model = STDPTransformerWithEmbeddings(k, heads, vocab_size, num_layers=NUM_LAYERS)
+u_shaped_network.add_monitor(monitor=source_monitor, name="Input")
+u_shaped_network.add_monitor(monitor=target_monitor, name="Output")
 
-# サンプルデータをモデルに通して動作確認
-sample_input, sample_output = next(iter(dataloader))
-model_output = model(sample_input, sample_output)
-print(model_output.shape)
+# Create input spike data, where each spike is distributed according to Bernoulli(0.1).
+spike_data = torch.bernoulli(0.1 * torch.ones(time, u_shaped_network.Input.n)).byte()
+inputs = {"Input": spike_data}
+
+# Simulate network on input data.
+u_shaped_network.run(inputs=inputs, time=time)
+snn_output = target_monitor.get("s")
+
+# 4. SNNの出力をSNNデコーダーでデコード
+snn_decoder = SNNDecoder()
+decoded_snn_output = snn_decoder.decode(snn_output)
+
+# 5. オートエンコーダーのデコーダー部分で元のデータを再構築
+reconstructed_data = autoencoder.decoder(decoded_snn_output)
+output = tensor_to_strings(reconstructed_data)
+
+print(output)
+
+# Retrieve and plot simulation spike, voltage data from monitors.
+spikes = {
+    "Input": source_monitor.get("s"), "Output": target_monitor.get("s")
+}
+voltages = {"Output": target_monitor.get("v")}
+
+plt.ioff()
+plot_spikes(spikes)
+plot_voltages(voltages, plot_type="line")
+plt.show()
