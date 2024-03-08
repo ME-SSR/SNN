@@ -79,7 +79,7 @@ class QuantizedSpikingLayer(nn.Module):
 
         # 行列乗算
         self.membrane_potentials += torch.matmul(input_spike, self.weights)
-       
+
         # Quantize the spikes based on the membrane potentials
         quantized_spikes = torch.floor(self.membrane_potentials / self.threshold * self.levels) / self.levels
         # Reset the membrane potentials where they have exceeded the threshold
@@ -107,42 +107,93 @@ class Synapse(nn.Module):
 # ■     ■■   ■■■■   ■■   ■   ■■    ■■■■   ■    ■   ■
 
 # ネットワークモデルの定義
+# 脊髄アナログのネットワーク定義
 class SpinalCord(nn.Module):
     def __init__(self, input_size, output_size, feedback_size):
         super(SpinalCord, self).__init__()
-        # 脊髄経由層：感覚入力とフィードバック入力の結合
-        self.spinal_layer = QuantizedSpikingLayer(input_size=input_size + feedback_size, output_size=output_size, threshold=1.0, levels=3)
-        # 初期フィードバック入力を0に設定
+        layers = []
+        for _ in range(6):  # 6層のネットワーク
+            layers.append(QuantizedSpikingLayer(input_size=input_size + feedback_size, output_size=output_size, threshold=1.0, levels=3))
+            input_size = output_size  # 次の層の入力サイズを更新
+        self.layers = nn.ModuleList(layers)
         self.feedback_input = torch.zeros(feedback_size)
 
-    def forward(self, TOTAL_INPUT_SIZE):
-        # 現在の感覚入力と以前のフィードバック入力を結合
-        combined_input = torch.cat([TOTAL_INPUT_SIZE, self.feedback_input], dim=1)
-        # 脊髄経由層を通じて信号を処理
-        processed_signal = self.spinal_layer(combined_input)
-        return processed_signal
+    def forward(self, TOTAL_INPUT_SIZE, higher_feedback):
+        x = torch.cat([TOTAL_INPUT_SIZE, self.feedback_input + higher_feedback], dim=1)
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
-# 小脳アナログのネットワークの定義
+# 小脳アナログのネットワーク定義
 class Cerebellum(nn.Module):
-    def __init__(self, input_size, feedback_size):
+    def __init__(self, input_size, output_size, feedback_size):
         super(Cerebellum, self).__init__()
-        # 小脳層：脊髄からの信号を処理
-        self.cerebellum_layer = QuantizedSpikingLayer(input_size=input_size, output_size=feedback_size, threshold=1.0, levels=3)
+        layers = []
+        for _ in range(6):  # 6層のネットワーク
+            layers.append(QuantizedSpikingLayer(input_size=input_size + feedback_size, output_size=output_size, threshold=1.0, levels=3))
+            input_size = output_size  # 次の層の入力サイズを更新
+        self.layers = nn.ModuleList(layers)
+        self.feedback_input = torch.zeros(feedback_size)
 
-    def forward(self, spinal_signal):
-        # 小脳層を通じて信号を処理
-        feedback_signal = self.cerebellum_layer(spinal_signal)
-        return feedback_signal
+    def forward(self, spinal_signal, higher_feedback):
+        x = torch.cat([spinal_signal, self.feedback_input + higher_feedback], dim=1)
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
-# 環境と連携するためのタイムステップベースの関数
-def timestep_processing(TOTAL_INPUT_SIZE, spinal_cord, cerebellum):
-    # 脊髄ネットワークを通じて処理
-    spinal_output = spinal_cord(TOTAL_INPUT_SIZE)
-    # 小脳ネットワークを通じてフィードバック信号を生成
-    feedback_signal = cerebellum(spinal_output)
-    # フィードバック信号を次のタイムステップの脊髄入力に更新
-    spinal_cord.feedback_input = feedback_signal
-    return spinal_output, feedback_signal
+# 大脳アナログのネットワーク定義
+class Cerebrum(nn.Module):
+    def __init__(self, input_size, output_size, feedback_size):
+        super(Cerebrum, self).__init__()
+        layers = []
+        for _ in range(6):  # 6層のネットワーク
+            layers.append(QuantizedSpikingLayer(input_size=input_size + feedback_size, output_size=output_size, threshold=1.0, levels=3))
+            input_size = output_size  # 次の層の入力サイズを更新
+        self.layers = nn.ModuleList(layers)
+        self.feedback_input = torch.zeros(feedback_size)
+
+    def forward(self, cerebellum_signal, higher_feedback):
+        x = torch.cat([cerebellum_signal, self.feedback_input + higher_feedback], dim=1)
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+# 前頭葉アナログのネットワーク定義
+
+class PrefrontalCortex(nn.Module):
+    def __init__(self, input_size, output_size, feedback_size):
+        super(PrefrontalCortex, self).__init__()
+        layers = []
+        for _ in range(6):  # 6層のネットワーク
+            layers.append(QuantizedSpikingLayer(input_size=input_size + feedback_size, output_size=output_size, threshold=1.0, levels=3))
+            input_size = output_size  # 次の層の入力サイズを更新
+        self.layers = nn.ModuleList(layers)
+        self.feedback_input = torch.zeros(feedback_size)
+
+    def forward(self, cerebrum_signal, higher_feedback):
+        x = torch.cat([cerebrum_signal, self.feedback_input + higher_feedback], dim=1)
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+# タイムステップベースの処理関数を更新
+def timestep_processing(TOTAL_INPUT_SIZE, spinal_cord, cerebellum, cerebrum, prefrontal_cortex, feedback_size):
+    # 初期フィードバックはゼロ
+    higher_feedback = torch.zeros(1, feedback_size)
+
+    # 各層を通じて処理を実行
+    spinal_output = spinal_cord(TOTAL_INPUT_SIZE, higher_feedback)
+    cerebellum_feedback = cerebellum(spinal_output, higher_feedback)
+    cerebrum_feedback = cerebrum(cerebellum_feedback, higher_feedback)
+    prefrontal_feedback = prefrontal_cortex(cerebrum_feedback, higher_feedback)
+
+    # フィードバックの更新
+    spinal_cord.feedback_input = prefrontal_feedback  # 脊髄へのフィードバックは前頭葉から
+    cerebellum.feedback_input = spinal_output  # 小脳へのフィードバックは脊髄の出力を使用
+    cerebrum.feedback_input = cerebellum_feedback  # 大脳へのフィードバックは小脳の出力を使用
+    prefrontal_cortex.feedback_input = cerebrum_feedback  # 前頭葉へのフィードバックは大脳の出力を使用
+
+    return spinal_output, cerebellum_feedback, cerebrum_feedback, prefrontal_feedback
 
 class MultiTaskSNN(nn.Module):
     def __init__(self, input_size=50, feedback_size=20, time_steps=10):
@@ -194,7 +245,7 @@ class MultiTaskSNN(nn.Module):
             outputs.append(task_output)
         # Return the outputs of the last time step
         return outputs[-1]
-        
+
 #note: エラートレースバック機能を消してはいけない！
 def dynamic_snn_interface(settings):
     try:
