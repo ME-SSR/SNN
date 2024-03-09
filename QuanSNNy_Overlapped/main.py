@@ -4,19 +4,13 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
-import gymnasium as gym
 import gradio as gr
 import json
 import traceback
+import networkx as nx
+import io
+from PIL import Image
 
-# このAIはGUI上でネットワークの形状を確認、
-# また視覚的に脊椎に与えるデータの宛先ニューロンを指定したり
-# 出力に使う宛先ニューロンを指定したりできます。
-# 与えられたデータの種類やその宛先ニューロン、
-# 出力の宛先ニューロンはコンソールニューロンに対して情報が渡されます。
-# コードの可視化にはgradioを使用します
-
-TOTAL_OUTPUT_SIZE = 70
 
 # ■■    ■■
 # ■■■   ■■
@@ -195,86 +189,111 @@ def timestep_processing(TOTAL_INPUT_SIZE, spinal_cord, cerebellum, cerebrum, pre
 
     return spinal_output, cerebellum_feedback, cerebrum_feedback, prefrontal_feedback
 
-class MultiTaskSNN(nn.Module):
-    def __init__(self, input_size=50, feedback_size=20, time_steps=10):
-        super(MultiTaskSNN, self).__init__()
-        self.input_size = input_size
-        self.feedback_size = feedback_size
-        self.time_steps = time_steps
-        self.task_output_sizes = {}  # 空の辞書で初期化
-        self.dummy_size = 0  # ダミーニューロンの数、後で更新
-        self.update_network()
+class UBrainArchitecture(nn.Module):
+    def __init__(self, input_size, output_size, feedback_size):
+        super(UBrainArchitecture, self).__init__()
+        # Initialize the modules
+        self.spinal_cord = SpinalCord(input_size, output_size, feedback_size)
+        self.cerebellum = Cerebellum(input_size, output_size, feedback_size)
+        self.cerebrum = Cerebrum(input_size, output_size, feedback_size)
+        self.prefrontal_cortex = PrefrontalCortex(input_size, output_size, feedback_size)
 
-    def update_network(self):
-        total_task_output_size = sum(self.task_output_sizes.values())
-        self.dummy_size = max(0, TOTAL_OUTPUT_SIZE - total_task_output_size)  # 余ったニューロンをダミーとして計算
-        total_output_size = total_task_output_size + self.dummy_size  # 実際のタスク出力とダミー出力の合計
-        self.shared_layer = QuantizedSpikingLayer(input_size=self.input_size + self.feedback_size, output_size=20, threshold=1.0, levels=3)
-        self.common_output_layer = QuantizedSpikingLayer(input_size=20, output_size=total_output_size, threshold=1.0, levels=3)
-        self.feedback_memory = torch.zeros(self.feedback_size)
+    def forward(self, total_input_size):
+        # Process through the UBrain Architecture
+        spinal_output, cerebellum_feedback, cerebrum_feedback, prefrontal_feedback = timestep_processing(
+            total_input_size,
+            self.spinal_cord,
+            self.cerebellum,
+            self.cerebrum,
+            self.prefrontal_cortex,
+            feedback_size=total_input_size.shape[1]  # Assuming feedback_size is the same as the input size for simplicity
+        )
+        return spinal_output, cerebellum_feedback, cerebrum_feedback, prefrontal_feedback
 
-    def add_task(self, task_name, output_size):
-        self.task_output_sizes[task_name] = output_size
-        self.update_network()
+    def update_feedback(self, feedback):
+        # This method can be used to update feedback inputs from external sources if necessary
+        self.spinal_cord.feedback_input = feedback['spinal']
+        self.cerebellum.feedback_input = feedback['cerebellum']
+        self.cerebrum.feedback_input = feedback['cerebrum']
+        self.prefrontal_cortex.feedback_input = feedback['prefrontal']
 
-    def remove_task(self, task_name):
-        if task_name in self.task_output_sizes:
-            del self.task_output_sizes[task_name]
-            self.update_network()
+class ConvQuantizedSNNEncoder(nn.Module):
+    def __init__(self, input_channels, output_channels, kernel_size, stride, padding, levels=3):
+        super(ConvQuantizedSNNEncoder, self).__init__()
+        self.conv = nn.Conv2d(input_channels, output_channels, kernel_size, stride, padding)
+        self.threshold = 1.0  # 量子化の閾値
+        self.levels = levels  # 量子化レベル
 
-    def forward(self, x, task):
-        # 確認する: taskが有効な値である
-        if task not in self.task_output_sizes:
-            raise ValueError(f"Invalid task: {task}. Valid tasks are: {list(self.task_output_sizes.keys())}")
+    def forward(self, x):
+        x = self.conv(x)  # 畳み込みを適用
+        x = F.relu(x)  # 活性化関数を適用
+        # 量子化処理
+        x = torch.floor(x / self.threshold * self.levels) / self.levels
+        return x
 
-        outputs = []
-        for t in range(self.time_steps):
-            # 同じ修正を繰り返します: テンソルの次元を確認
-            x = x.unsqueeze(0) if x.dim() == 1 else x
-            feedback_input = self.feedback_memory.unsqueeze(0) if self.feedback_memory.dim() == 1 else self.feedback_memory
-            combined_input = torch.cat([x, feedback_input], dim=1)
-            x_shared = self.shared_layer(combined_input)
-            x_output = self.common_output_layer(x_shared)
-            # Update feedback memory for the next time step, ensure it's detached from the graph
-            self.feedback_memory = x_output[:, :self.feedback_size].detach()
+class EmptyDecoder(nn.Module):
+    def __init__(self, input_size, output_size):
+        super(EmptyDecoder, self).__init__()
+        # このデコーダーは入力をそのまま出力にしますが、将来的な拡張のための基本構造を提供します。
+        self.linear = nn.Linear(input_size, output_size)  # 現在は使用していませんが、将来のために含めます。
 
-            # タスクに関する出力の選択: タスク名に基づくエラーを防ぐためのチェック追加
-            start_index = sum(self.task_output_sizes[t] for t in sorted(self.task_output_sizes) if t is not None and t < task)
-            end_index = start_index + self.task_output_sizes[task]
-            task_output = x_output[:, start_index:end_index]
-            outputs.append(task_output)
-        # Return the outputs of the last time step
-        return outputs[-1]
+    def forward(self, x):
+        # 現在は入力をそのまま返しますが、後の拡張性のためにはここに処理を追加します。
+        return x
 
-#note: エラートレースバック機能を消してはいけない！
-def dynamic_snn_interface(settings):
+
+
+def create_and_plot_network(json_params):
     try:
-        # JSON文字列を辞書に変換
-        settings_dict = json.loads(settings)
-        input_size = settings_dict['input_size']
-        time_steps = settings_dict['time_steps']
-        tasks = settings_dict['tasks']
+        # JSONパラメータを読み込む
+        config = json.loads(json_params)
+        encoders = config.get('encoders', [])
+        decoders = config.get('decoders', [])
 
-        # SNNの初期化
-        snn = MultiTaskSNN(input_size=input_size, time_steps=time_steps)
+        if not encoders or not decoders:
+            raise ValueError("JSONファイルには、'encoders' および 'decoders' セクションが必要です。")
 
-        # タスクの設定
-        for task_name, output_size in tasks.items():
-            snn.add_task(task_name, output_size)
+        # ネットワークトポロジーを作成
+        G = nx.DiGraph()
+        for i, encoder in enumerate(encoders):
+            G.add_node(f"Encoder{i+1}", type=encoder.get('type', 'Unknown'), dims=encoder.get('dims', 'Unknown'))
+        for i, decoder in enumerate(decoders):
+            G.add_node(f"Decoder{i+1}", type=decoder.get('type', 'Unknown'), dims=decoder.get('dims', 'Unknown'))
+        for i in range(len(encoders)):
+            for j in range(len(decoders)):
+                G.add_edge(f"Encoder{i+1}", f"Decoder{j+1}")
 
-        # 例示的な入力でSNNをテスト
-        example_input = torch.rand(1, input_size)
-        outputs = {task_name: snn(example_input, task_name).tolist() for task_name in tasks}
-        return json.dumps(outputs)  # 辞書をJSON文字列に変換して返す
+        # トポロジーをプロット
+        plt.figure(figsize=(8, 6))
+        pos = nx.spring_layout(G)
+        labels = {node: f"{data['type']}({data['dims']})" for node, data in G.nodes(data=True)}
+        nx.draw(G, pos, with_labels=True, labels=labels, node_size=2000, node_color='lightblue')
+        plt.title("Network Topology")
+
+        # プロットをバイナリストリームとして保存し、PIL Imageに変換
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        image = Image.open(buf)
+        plt.close()  # プロットをクリア
+
+        # PIL Imageを返す
+        return image
+
+    except json.JSONDecodeError:
+        return "エラー: JSONファイルの形式が無効です。"
+    except ValueError as e:
+        return f"エラー: {e}"
     except Exception as e:
-        # エラーメッセージとトレースバックを返す
-        error_message = f"An error occurred: {str(e)}"
-        error_traceback = traceback.format_exc()  # エラートレースバックを取得
-        return json.dumps({"error": error_message, "traceback": error_traceback})
+        return f"エラー: 不明なエラーが発生しました。{e}"
 
+# Gradioインターフェースの設定
 iface = gr.Interface(
-    fn=dynamic_snn_interface,
-    inputs=[gr.Textbox(label="Settings (JSON format)")],
-    outputs="text"
+    fn=create_and_plot_network,
+    inputs=[gr.Textbox(label="JSONファイルのパラメータ", placeholder="ここにJSONパラメータを入力")],
+    outputs=[gr.Image(label="ネットワークトポロジー")],
+    allow_flagging="never"
 )
+
+# Gradioインターフェースを起動
 iface.launch()
