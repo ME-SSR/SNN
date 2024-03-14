@@ -1,4 +1,4 @@
-# S.E.N
-## Spiking Essential NeuralNetwork
+# QuanSNNy Overlapper
+## Quantized Spiking Neural Network with Overlapped Network
 
 hoge
