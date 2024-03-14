@@ -12,49 +12,7 @@ import traceback
 
 import pandas as pd
 
-class PatchedTensor:
-    @staticmethod
-    def extract_patches(input_tensor, patch_size, stride):
-        # Ensure that the stride equals patch_size to prevent overlapping
-        if stride != patch_size:
-            raise ValueError("Stride must be equal to patch size to prevent overlapping.")
 
-        # Ensure input tensor is in the expected format
-        if len(input_tensor.size()) != 2:  # Assuming [H, W]
-            raise ValueError("Input tensor must be of shape [H, W].")
-
-        H, W = input_tensor.size()
-
-        # Calculate necessary padding for H and W dimensions
-        pad_height = (patch_size - H % patch_size) % patch_size
-        pad_width = (patch_size - W % patch_size) % patch_size
-
-        # Apply padding to the input tensor
-        padded_input = F.pad(input_tensor, (0, pad_width, 0, pad_height), mode='constant', value=0)
-
-        # Unfold the padded tensor to extract patches
-        patches = padded_input.unfold(0, patch_size, stride).unfold(1, patch_size, stride)
-        num_patches = (H + pad_height) // patch_size * (W + pad_width) // patch_size
-        patches = patches.contiguous().view(num_patches, patch_size, patch_size)
-        return patches
-
-    @staticmethod
-    def merge_patches(patches, output_size):
-        # Ensure output_size is in the expected format
-        if len(output_size) != 2:  # Assuming [H, W]
-            raise ValueError("Output size must be [H, W].")
-
-        H, W = output_size
-        output_tensor = torch.zeros(H, W, device=patches.device)
-        num_patches_height = (H + patches.size(1) - 1) // patches.size(1)
-        num_patches_width = (W + patches.size(2) - 1) // patches.size(2)
-
-        for i in range(num_patches_height):
-            for j in range(num_patches_width):
-                output_tensor[i * patches.size(1):min((i + 1) * patches.size(1), H),
-                              j * patches.size(2):min((j + 1) * patches.size(2), W)] = patches[i * num_patches_width + j, :min(patches.size(1), H - i * patches.size(1)), :min(patches.size(2), W - j * patches.size(2))]
-
-        return output_tensor
 
 
 
@@ -149,11 +107,75 @@ class Subnetwork(nn.Module):
         self.layers = nn.ModuleList(layers)
         self.input_size = input_size
         self.output_size = output_size
+        self.update_structure(input_size, output_size, num_layers, threshold, levels, use_stdp)
+
+    def update_structure(self, input_size, output_size, num_layers, threshold=1.0, levels=3, use_stdp=False):
+        self.input_size = input_size
+        self.output_size = output_size
+        layers = [QuantizedSpikingLayer(input_size, output_size, threshold, levels, use_stdp)]
+        for _ in range(1, num_layers):
+            layers.append(QuantizedSpikingLayer(output_size, output_size, threshold, levels, use_stdp))
+        self.layers = nn.ModuleList(layers)
 
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
         return x
+
+class DynamicDataHandler:
+    def __init__(self):
+        self.encoder_data_pairs = []
+        self.decoder_data_pairs = []
+        self.names = {}  # インデックスと名前のマッピング
+
+    def add_pair(self, encoder_name, encoder_subnetwork, sensor_data, decoder_name, decoder_subnetwork, output_data):
+        # 名前とサブネットワークをペアとして追加
+        self.encoder_data_pairs.append((encoder_subnetwork, sensor_data))
+        self.decoder_data_pairs.append((decoder_subnetwork, output_data))
+
+    def remove_pair_by_name(self, name):
+        # 名前に基づいてペアを削除
+        if name in self.names:
+            index = self.names[name]
+            del self.encoder_data_pairs[index]
+            del self.decoder_data_pairs[index]
+            del self.names[name]  # 名前をマップから削除
+            # インデックスを更新
+            new_names = {}
+            for n, i in self.names.items():
+                new_names[n] = i - 1 if i > index else i
+            self.names = new_names
+        else:
+            raise ValueError(f"Pair with name {name} does not exist.")
+
+    def get_index(self, name):
+        # 名前からインデックスを取得
+        if name in self.names:
+            return self.names[name]
+        else:
+            raise ValueError(f"Name {name} does not exist.")
+
+    def get_encoder_by_name(self, name):
+        # 名前からエンコーダを取得
+        index = self.get_index(name)
+        return self.encoder_data_pairs[index][0]
+
+    def get_decoder_by_name(self, name):
+        # 名前からデコーダを取得
+        index = self.get_index(name)
+        return self.decoder_data_pairs[index][0]
+
+    def get_encoders(self):
+        return [pair[0] for pair in self.encoder_data_pairs]
+
+    def get_decoders(self):
+        return [pair[0] for pair in self.decoder_data_pairs]
+
+    def get_sensor_data(self):
+        return [pair[1] for pair in self.encoder_data_pairs]
+
+    def get_output_data(self):
+        return [pair[1] for pair in self.decoder_data_pairs]
 
 
 
@@ -181,7 +203,7 @@ class SpinalCord(nn.Module):
 
     def forward(self, input_signal, higher_feedback):
         # Concatenate input_signal and higher_feedback along the feature dimension
-        x = input_signal + higher_feedback 
+        x = input_signal + higher_feedback
         for layer in self.layers:
             x = layer(x)
         return x
@@ -198,7 +220,7 @@ class Cerebellum(nn.Module):
 
     def forward(self, input_signal, higher_feedback):
         # Concatenate input_signal and higher_feedback along the feature dimension
-        x = input_signal + higher_feedback 
+        x = input_signal + higher_feedback
         for layer in self.layers:
             x = layer(x)
         return x
@@ -215,7 +237,7 @@ class Cerebrum(nn.Module):
 
     def forward(self, input_signal, higher_feedback):
         # Concatenate input_signal and higher_feedback along the feature dimension
-        x = input_signal + higher_feedback 
+        x = input_signal + higher_feedback
         for layer in self.layers:
             x = layer(x)
         return x
@@ -237,75 +259,83 @@ class PrefrontalCortex(nn.Module):
         return x
 
 
+#                          ■         ■
+# ■■     ■■■               ■         ■
+# ■■■    ■■■               ■         ■
+# ■■■    ■■■   ■■■■    ■■■■■   ■■■■  ■
+# ■ ■   ■■■■  ■■  ■■  ■■  ■■  ■■  ■  ■
+# ■  ■  ■ ■■  ■    ■  ■    ■  ■   ■■ ■
+# ■  ■  ■ ■■  ■    ■  ■    ■  ■■■■■■ ■
+# ■  ■■■  ■■  ■    ■  ■    ■  ■      ■
+# ■   ■■  ■■  ■■  ■■  ■■  ■■  ■■     ■
+# ■   ■   ■■   ■■■■    ■■■ ■   ■■■■  ■
+
 
 class UModel(nn.Module):
     def __init__(self, total_output_size, patch_size):
         super(UModel, self).__init__()
+        self.dynamic_data_handler = DynamicDataHandler()  # ここで動的データハンドラを初期化
         self.patch_size = patch_size
         self.total_output_size = total_output_size
-        self.encoder_subnetworks = nn.ModuleList()
-        self.decoder_subnetworks = nn.ModuleList()
-        # Initialize UModel layers
+        # メインネットワークを初期化
+        self.initialize_main_networks(total_output_size)
+        # UModelレイヤーを初期化
         self.spinal_cord = SpinalCord(total_output_size)
         self.cerebellum = Cerebellum(total_output_size)
         self.cerebrum = Cerebrum(total_output_size)
         self.prefrontal_cortex = PrefrontalCortex(total_output_size)
-        # Initialize feedback inputs for each analog with zeros
+        # 各アナログのフィードバック入力をゼロで初期化
         self.feedback_to_spinal = torch.zeros(1, total_output_size)
         self.feedback_to_cerebellum = torch.zeros(1, total_output_size)
         self.feedback_to_cerebrum = torch.zeros(1, total_output_size)
 
+    def initialize_main_networks(self, total_output_size):
+        self.spinal_cord = SpinalCord(total_output_size)
+        self.cerebellum = Cerebellum(total_output_size)
+        self.cerebrum = Cerebrum(total_output_size)
+        self.prefrontal_cortex = PrefrontalCortex(total_output_size)
 
-    def add_encoder_subnetwork(self, subnetwork):
-        self.encoder_subnetworks.append(subnetwork)
+    def process_sensor_data(self, sensor_data_list):
+        # 処理を実行する前に、encoder_subnetworksと長さが一致するか確認
+        assert len(sensor_data_list) == len(self.dynamic_data_handler.get_encoders()), \
+            "Length of sensor_data_list must match the number of encoder subnetworks."
 
-    def remove_encoder_subnetwork(self, index):
-        del self.encoder_subnetworks[index]
+        encoded_data_list = []
 
-    def add_decoder_subnetwork(self, subnetwork):
-        self.decoder_subnetworks.append(subnetwork)
+        # エンコード処理
+        for i, sensor_data in enumerate(sensor_data_list):
+            encoder = self.dynamic_data_handler.get_encoders()[i]
+            if sensor_data.size(1) > encoder.input_size:
+                print(f"Sensor data {i} is bigger than encoder size, trimming to fit.")
+                input_data = sensor_data[:, :encoder.input_size]
+            else:
+                input_data = sensor_data
+            encoded_data = encoder(input_data)
+            encoded_data_list.append(encoded_data)
 
-    def remove_decoder_subnetwork(self, index):
-        del self.decoder_subnetworks[index]
+        # エンコードされたデータを統合
+        integrated_input = torch.cat(encoded_data_list, dim=1) if encoded_data_list else torch.zeros(1, self.total_output_size)
+        if integrated_input.size(1) < self.total_output_size:
+            padding_size = self.total_output_size - integrated_input.size(1)
+            integrated_input = F.pad(integrated_input, (0, padding_size), 'constant', 0)
 
-    def forward(self, sensor_data_list):
-        # Initialize feedback if not initialized or update if necessary
-        if self.feedback_to_spinal is None:
-            # Assuming feedback tensors are the same size as the output
-            self.feedback_to_spinal = torch.zeros(sensor_data_list[0].shape[0], self.total_output_size, device=sensor_data_list[0].device)
-        
-        # Process each sensor data through its subnetwork
-        encoded_data = []
-        for i, data in enumerate(sensor_data_list):
-            if i < len(self.encoder_subnetworks):
-                encoded_patch = self.encoder_subnetworks[i](data)
-                encoded_data.append(encoded_patch)
-
-        # Integrate the encoded data
-        integrated_input = torch.cat(encoded_data, dim=1)  # Concatenate data horizontally
-
-        # Pass through UModel's main layers with higher feedback
+        # 中央処理ユニットを通す
         spinal_output = self.spinal_cord(integrated_input, self.feedback_to_spinal)
-        # Update feedback for the next layers
-        self.feedback_to_cerebellum = spinal_output.detach()  # Detach from the current computation graph if necessary
-        cerebellum_output = self.cerebellum(spinal_output, self.feedback_to_cerebellum)
-        self.feedback_to_cerebrum = cerebellum_output.detach()
-        cerebrum_output = self.cerebrum(cerebellum_output, self.feedback_to_cerebrum)
-        # No higher feedback for the prefrontal cortex, it's the top layer
-        prefrontal_output = self.prefrontal_cortex(cerebrum_output)
+        self.feedback_to_spinal = cerebellum_output = self.cerebellum(spinal_output, self.feedback_to_cerebellum)
+        self.feedback_to_cerebellum = cerebrum_output = self.cerebrum(cerebellum_output, self.feedback_to_cerebrum)
+        self.feedback_to_cerebrum = prefrontal_output = self.prefrontal_cortex(cerebrum_output)
 
-        # Split UModel's output into segments corresponding to each subnetwork
-        output_segments = torch.split(prefrontal_output, [sub.output_size for sub in self.decoder_subnetworks], dim=1)
+        # デコード処理
+        output_data_list = []
+        for decoder in self.dynamic_data_handler.get_decoders():
+            segment_size = decoder.input_size
+            segment = prefrontal_output[:, :segment_size]
+            decoded_data = decoder(segment)
+            output_data_list.append(decoded_data)
 
-        # Pass the split data through the decoder subnetworks
-        decoded_data = []
-        for i, segment in enumerate(output_segments):
-            if i < len(self.decoder_subnetworks):
-                decoded_patch = self.decoder_subnetworks[i](segment)
-                decoded_data.append(decoded_patch)
+        return output_data_list
 
-        # Return the list of decoded data
-        return decoded_data
+
 
 
 # モデルパラメータを設定
@@ -313,18 +343,41 @@ total_output_size = 20
 patch_size = 5
 batch_size = 1  # バッチサイズ
 
-# モデルのインスタンスを作成
+# UModelのインスタンスを作成
 model = UModel(total_output_size, patch_size)
-model.add_encoder_subnetwork(Subnetwork(total_output_size, total_output_size, 3, 1.0, 3, False))
-model.add_decoder_subnetwork(Subnetwork(total_output_size, total_output_size, 3, 1.0, 3, False))
 
-# テスト用のサンプルデータを生成
-sensor_data_list = [torch.randn(batch_size, total_output_size) for _ in range(4)]  # 仮定: 4つのセンサーデータ
+# 個々のエンコーダーとデコーダーのサブネットワーク、および関連するデータを名前付きで追加
+# 各センサーデータとダミーの出力データ
+sensor_data_camera1 = torch.randn(batch_size, 3)
+sensor_data_camera2 = torch.randn(batch_size, 4)
+sensor_data_camera3 = torch.randn(batch_size, 5)
+sensor_data_camera4 = torch.randn(batch_size, 6)
 
-# モデルを通じてテスト入力を実行
-output_data_list = model(sensor_data_list)
+# エンコーダーとデコーダーのサブネットワークを定義して追加
+encoder_camera1 = Subnetwork(3, 5, 3, 1.0, 3, False)
+encoder_camera2 = Subnetwork(4, 5, 3, 1.0, 3, False)
+encoder_camera3 = Subnetwork(5, 5, 3, 1.0, 3, False)
+encoder_camera4 = Subnetwork(6, 5, 3, 1.0, 3, False)
 
-# 結果を表示
-print("Input signal shapes:", [d.shape for d in sensor_data_list])
-print("Output signal shapes:", [d.shape for d in output_data_list])
+decoder_motor1 = Subnetwork(5, 5, 3, 1.0, 3, False)
+decoder_motor2 = Subnetwork(5, 5, 3, 1.0, 3, False)
+decoder_motor3 = Subnetwork(5, 5, 3, 1.0, 3, False)
+decoder_motor4 = Subnetwork(5, 5, 3, 1.0, 3, False)
 
+dummy_output_data = torch.empty(batch_size, 5)  # 処理前なので空のテンソルを作成
+
+# 名前を付けてペアを追加
+model.dynamic_data_handler.add_pair("カメラ1", encoder_camera1, sensor_data_camera1, "モーター1", decoder_motor1, dummy_output_data)
+model.dynamic_data_handler.add_pair("カメラ2", encoder_camera2, sensor_data_camera2, "モーター2", decoder_motor2, dummy_output_data)
+model.dynamic_data_handler.add_pair("カメラ3", encoder_camera3, sensor_data_camera3, "モーター3", decoder_motor3, dummy_output_data)
+model.dynamic_data_handler.add_pair("カメラ4", encoder_camera4, sensor_data_camera4, "モーター4", decoder_motor4, dummy_output_data)
+
+# センサーデータリストをモデルを通じて処理
+output_data_lists = model.process_sensor_data([sensor_data_camera1, sensor_data_camera2, sensor_data_camera3, sensor_data_camera4])
+
+# 処理後の出力データでデコーダーのデータを更新
+for i, output_data in enumerate(output_data_lists):
+    # デコーダーデータを更新
+    model.dynamic_data_handler.decoder_data_pairs[i] = (model.dynamic_data_handler.get_decoders()[i], output_data)
+
+print(output_data_lists)
